@@ -9,6 +9,11 @@ control table (read on every query, so changes take effect immediately):
               resolver's upstream timeout, to exercise late-answer handling)
   timeout  -- never answer (simulates the authoritative endpoint being lost)
 
+An active trial cut-over overlays the base state: the endpoint answers the
+trial IPv4 immediately (as a plain A record, no delay), and the trial's
+absolute deadline is honoured by the reader, so it takes effect right away and
+expires even if the web console is not running.
+
 Every received query is logged to auth_log so the console can show what the
 upstream actually saw and did.
 """
@@ -31,10 +36,11 @@ def handle(data: bytes, addr, sock: socket.socket) -> None:
         query = DNSRecord.parse(data)
         qname = str(query.q.qname)
         qtype = QTYPE[query.q.qtype]
-        ctl = common.get_control() or {
-            "mode": "a", "ip": common.DEFAULT_IP, "delay_seconds": common.DEFAULT_DELAY
-        }
+        ctl, trial = common.effective_control()
         mode = ctl["mode"]
+        trial_suffix = (
+            f" trial={trial['trial_no']}" if ctl.get("trial") else ""
+        )
 
         in_scope = (
             str(query.q.qname).rstrip(".").lower() == common.FIXED_DOMAIN.lower()
@@ -69,7 +75,8 @@ def handle(data: bytes, addr, sock: socket.socket) -> None:
         )
         sock.sendto(rep.pack(), addr)
         suffix = (f" after {ctl['delay_seconds']}s delay" if mode == "delay" else "")
-        common.log_auth(qname, qtype, mode, "answered", f"A={ctl['ip']}{suffix}")
+        common.log_auth(qname, qtype, mode, "answered",
+                        f"A={ctl['ip']}{suffix}{trial_suffix}")
     except Exception:
         common.log_auth(qname, qtype, mode, "error", traceback.format_exc(limit=3))
 

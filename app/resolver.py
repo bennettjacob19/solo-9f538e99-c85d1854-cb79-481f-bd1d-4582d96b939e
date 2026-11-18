@@ -16,6 +16,20 @@ Behaviour (all timings from app.common, defaults are the spec values):
   * cache deadlines are absolute epochs persisted in SQLite, so a restart does
     not extend the validity of an old A record.
 
+Trial cut-over interaction:
+
+  * the authoritative endpoint switches to a trial IPv4 the moment the trial
+    starts; the transition deletes the resolver cache in the same committed
+    transaction, so a query issued afterwards can never be answered from the
+    previous state;
+  * every trial/control transition bumps a persisted ``generation``.  A fetch
+    remembers the generation it was started in and only writes its result back
+    if the generation is unchanged, so an upstream reply that arrives after the
+    state changed cannot re-insert the now-invalid address;
+  * if the generation changes while a query is being resolved, the query is
+    re-resolved against the new state (bounded), rather than answering with the
+    stale state.
+
 The resolver reports where each answer came from in an additional-section TXT
 record (_src.<domain> TXT "source=upstream|cache-fresh|cache-stale|none ...")
 and logs every query to the query_log table for the web console.
@@ -31,6 +45,8 @@ import traceback
 from dnslib import A, CLASS, QTYPE, RCODE, RR, TXT, DNSHeader, DNSRecord
 
 from . import common
+
+MAX_STATE_RETRIES = 3
 
 
 def _same_name(a, b) -> bool:
@@ -93,12 +109,8 @@ def _reply(query: DNSRecord, rcode: int, answers=(), source="none", detail="") -
     return rep
 
 
-def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
-    """Resolve the fixed domain's A record.  Returns (reply, source, detail)."""
-    now = time.time()
-    row = common.get_cache()
-
-    # 1) fresh cache hits
+def _cached_reply(query: DNSRecord, row: dict, now: float):
+    """Answer from a cache row if it is fresh; return (reply, source, detail)."""
     if row and row["rcode"] == "NOERROR" and row["a_record"] and now < row["fresh_until"]:
         ttl = max(1, int(row["fresh_until"] - now + 0.999))
         return (
@@ -114,53 +126,83 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
             "cache-fresh",
             "fresh NXDOMAIN from cache",
         )
+    return None
 
-    # 2) expired: ask the authoritative endpoint
-    resp = upstream_query()
-    now2 = time.time()
 
-    if resp is not None and resp.header.rcode == RCODE.NOERROR:
-        ips = [str(rr.rdata) for rr in resp.rr if rr.rtype == QTYPE.A]
-        if ips:
-            common.put_cache_a(ips[0], now2)
+def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
+    """Resolve the fixed domain's A record.  Returns (reply, source, detail)."""
+    for _attempt in range(MAX_STATE_RETRIES):
+        now = time.time()
+        trial, _control, row = common.snapshot(now)
+        generation = int(trial["generation"])
+
+        # 1) fresh cache hits
+        hit = _cached_reply(query, row, now)
+        if hit is not None:
+            return hit
+
+        # 2) expired: ask the authoritative endpoint
+        resp = upstream_query()
+        now2 = time.time()
+
+        if resp is not None and resp.header.rcode == RCODE.NOERROR:
+            ips = [str(rr.rdata) for rr in resp.rr if rr.rtype == QTYPE.A]
+            if ips:
+                # Guarded write: if the state changed during the fetch, this is
+                # a reply from a state that no longer exists -- drop it and
+                # re-resolve against the new state.
+                if common.put_cache_a(ips[0], now2, generation=generation):
+                    return (
+                        _reply(query, RCODE.NOERROR,
+                               [_a_rr(ips[0], int(common.FRESH_TTL))], "upstream"),
+                        "upstream",
+                        f"fetched A={ips[0]}",
+                    )
+                continue
+
+        if resp is not None and resp.header.rcode == RCODE.NXDOMAIN:
+            # Confirming NXDOMAIN purges the old A record (durably, in SQLite).
+            if common.put_cache_nxdomain(now2, generation=generation):
+                return (
+                    _reply(query, RCODE.NXDOMAIN, [], "upstream", "nxdomain-confirmed"),
+                    "upstream",
+                    "NXDOMAIN confirmed; old A purged",
+                )
+            continue
+
+        # 3) upstream timeout / unusable reply: maybe serve the stale A record
+        #    (NXDOMAIN is never served stale).  Re-read the state so a cache
+        #    invalidated while we were waiting is never served.
+        trial2, _c2, row2 = common.snapshot(now2)
+        if int(trial2["generation"]) != generation:
+            continue  # state changed: re-resolve instead of serving old data
+        if (
+            row2
+            and row2["rcode"] == "NOERROR"
+            and row2["a_record"]
+            and row2["stale_until"]
+            and now2 < row2["stale_until"]
+        ):
+            ttl = max(1, int(row2["stale_until"] - now2 + 0.999))
             return (
-                _reply(query, RCODE.NOERROR, [_a_rr(ips[0], int(common.FRESH_TTL))],
-                       "upstream"),
-                "upstream",
-                f"fetched A={ips[0]}",
+                _reply(query, RCODE.NOERROR, [_a_rr(row2["a_record"], ttl)],
+                       "cache-stale", f"stale_left={row2['stale_until'] - now2:.1f}"),
+                "cache-stale",
+                "upstream timeout; serving stale A",
             )
 
-    if resp is not None and resp.header.rcode == RCODE.NXDOMAIN:
-        # Confirming NXDOMAIN purges the old A record (durably, in SQLite).
-        common.put_cache_nxdomain(now2)
         return (
-            _reply(query, RCODE.NXDOMAIN, [], "upstream", "nxdomain-confirmed"),
-            "upstream",
-            "NXDOMAIN confirmed; old A purged",
+            _reply(query, RCODE.SERVFAIL, [], "none", "upstream-timeout"),
+            "none",
+            "upstream timeout; no usable cache",
         )
 
-    # 3) upstream timeout / unusable reply: maybe serve the stale A record
-    #    (NXDOMAIN is never served stale).
-    row = common.get_cache()
-    if (
-        row
-        and row["rcode"] == "NOERROR"
-        and row["a_record"]
-        and row["stale_until"]
-        and now2 < row["stale_until"]
-    ):
-        ttl = max(1, int(row["stale_until"] - now2 + 0.999))
-        return (
-            _reply(query, RCODE.NOERROR, [_a_rr(row["a_record"], ttl)], "cache-stale",
-                   f"stale_left={row['stale_until'] - now2:.1f}"),
-            "cache-stale",
-            "upstream timeout; serving stale A",
-        )
-
+    # The state kept changing under us: fail closed rather than answer with a
+    # value that may belong to a superseded trial/control state.
     return (
-        _reply(query, RCODE.SERVFAIL, [], "none", "upstream-timeout"),
+        _reply(query, RCODE.SERVFAIL, [], "none", "state-churn"),
         "none",
-        "upstream timeout; no usable cache",
+        "state changed during resolution",
     )
 
 

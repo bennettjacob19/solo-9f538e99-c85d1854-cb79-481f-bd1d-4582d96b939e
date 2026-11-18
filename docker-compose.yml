@@ -30,6 +30,8 @@ services:
       FRESH_TTL: "5"        # successful answers are fresh for 5s
       STALE_WINDOW: "20"    # stale A usable at most 20s past expiry
       UPSTREAM_TIMEOUT: "2" # seconds waiting for the authoritative endpoint
+      TRIAL_MIN_SECONDS: "10"  # trial confirmation window lower bound
+      TRIAL_MAX_SECONDS: "60"  # trial confirmation window upper bound
     ports:
       - "5353:5353/udp"
     volumes:
@@ -47,6 +49,8 @@ services:
       WEB_PORT: "8000"
       RESOLVER_HOST: resolver
       RESOLVER_PORT: "5353"
+      TRIAL_MIN_SECONDS: "10"
+      TRIAL_MAX_SECONDS: "60"
     ports:
       - "8000:8000"
     volumes:
